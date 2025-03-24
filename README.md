@@ -2,17 +2,6 @@
 
 A secure implementation of a JSON Web Key Set (JWKS) server that manages cryptographic keys for JWT authentication. This server provides endpoints for JWT generation and public key distribution, supporting both valid and expired keys.
 
-## Gradebot
-
-![image](https://github.com/user-attachments/assets/6e6a997a-b216-476e-9392-49778464f226)
-
-## Test suite 
-
-![image](https://github.com/user-attachments/assets/554cccef-9f9e-4b18-923b-88f1938e97aa)
-
-
-
-
 ## Features
 
 - JWKS endpoint serving public keys
