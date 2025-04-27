@@ -4,7 +4,7 @@ const assert = require('assert');
 const { app } = require('./server');
 const sqlite3 = require('sqlite3').verbose();
 
-describe('JWKS Server with SQLite', () => {
+describe('Enhanced JWKS Server with SQLite', () => {
   let db;
 
   before((done) => {
@@ -32,6 +32,22 @@ describe('JWKS Server with SQLite', () => {
       db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='keys'", (err, row) => {
         if (err) return done(err);
         assert.ok(row, 'Keys table should exist');
+        done();
+      });
+    });
+    
+    it('should have created the users table', (done) => {
+      db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='users'", (err, row) => {
+        if (err) return done(err);
+        assert.ok(row, 'Users table should exist');
+        done();
+      });
+    });
+    
+    it('should have created the auth_logs table', (done) => {
+      db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='auth_logs'", (err, row) => {
+        if (err) return done(err);
+        assert.ok(row, 'Auth logs table should exist');
         done();
       });
     });
@@ -113,6 +129,91 @@ describe('JWKS Server with SQLite', () => {
           done();
         });
     });
+    
+    it('should log authentication requests', (done) => {
+      request(app)
+        .post('/auth')
+        .expect(200)
+        .end((err, res) => {
+          if (err) return done(err);
+          
+          // Check if the log was created
+          db.get('SELECT COUNT(*) as count FROM auth_logs', (err, row) => {
+            if (err) return done(err);
+            assert.ok(row.count > 0, 'Should have authentication logs');
+            done();
+          });
+        });
+    });
+    
+    it('should respect rate limits', function(done) {
+      this.timeout(5000);
+      
+      // Send 11 requests (1 more than the limit)
+      const requests = [];
+      for (let i = 0; i < 11; i++) {
+        requests.push(request(app).post('/auth'));
+      }
+      
+      // Execute all requests as fast as possible
+      Promise.all(requests.map(r => r.catch(e => e)))
+        .then(responses => {
+          // Check if at least one request was rate limited
+          const rateLimited = responses.some(res => res.status === 429);
+          assert.ok(rateLimited, 'Should have rate limited at least one request');
+          done();
+        })
+        .catch(done);
+    });
+  });
+
+  describe('POST /register', () => {
+    it('should register a new user and return a password', (done) => {
+      const username = `test_user_${Date.now()}`;
+      request(app)
+        .post('/register')
+        .send({ username, email: `${username}@example.com` })
+        .expect('Content-Type', /json/)
+        .expect(201)
+        .end((err, response) => {
+          if (err) return done(err);
+          
+          assert.ok(response.body.password, 'Should return a generated password');
+          
+          // Verify the user was created in the database
+          db.get('SELECT * FROM users WHERE username = ?', [username], (err, row) => {
+            if (err) return done(err);
+            assert.ok(row, 'User should exist in database');
+            assert.strictEqual(row.username, username);
+            assert.ok(row.password_hash.startsWith('$argon2'), 'Password should be hashed with Argon2');
+            done();
+          });
+        });
+    });
+    
+    it('should reject duplicate usernames', (done) => {
+      const username = `test_user_${Date.now()}`;
+      
+      // First registration
+      request(app)
+        .post('/register')
+        .send({ username, email: `${username}@example.com` })
+        .expect(201)
+        .end((err) => {
+          if (err) return done(err);
+          
+          // Try to register with the same username
+          request(app)
+            .post('/register')
+            .send({ username, email: `${username}2@example.com` })
+            .expect(409)
+            .end((err, res) => {
+              if (err) return done(err);
+              assert.strictEqual(res.body.error, 'Username already exists');
+              done();
+            });
+        });
+    });
   });
 
   describe('HTTP method handling', () => {
@@ -150,6 +251,23 @@ describe('JWKS Server with SQLite', () => {
           if (err) return done(err);
           assert.ok(res.body.token, 'Should return a token even with malicious input');
           done();
+        });
+    });
+    
+    it('should safely handle malicious input in registration', (done) => {
+      const maliciousUsername = "user'; DROP TABLE users; --";
+      request(app)
+        .post('/register')
+        .send({ username: maliciousUsername, email: 'test@example.com' })
+        .end((err) => {
+          if (err) return done(err);
+          
+          // Verify the users table still exists
+          db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='users'", (err, row) => {
+            if (err) return done(err);
+            assert.ok(row, 'Users table should still exist after SQL injection attempt');
+            done();
+          });
         });
     });
   });
