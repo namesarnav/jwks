@@ -1,11 +1,14 @@
 const request = require('supertest');
 const jwt = require('jsonwebtoken');
 const assert = require('assert');
-const { app } = require('./server');
+const { app, server } = require('./server');
 const sqlite3 = require('sqlite3').verbose();
+const sinon = require('sinon');
+const crypto = require('crypto');
 
 describe('Enhanced JWKS Server with SQLite', () => {
   let db;
+  let sandbox;
 
   before((done) => {
     // Connect to the database for testing
@@ -16,6 +19,7 @@ describe('Enhanced JWKS Server with SQLite', () => {
       // Ensure we have test data
       setTimeout(done, 500); // Give a moment for keys to be initialized
     });
+    sandbox = sinon.createSandbox();
   });
 
   after((done) => {
@@ -25,6 +29,7 @@ describe('Enhanced JWKS Server with SQLite', () => {
     } else {
       done();
     }
+    sandbox.restore();
   });
 
   describe('Database setup', () => {
@@ -61,6 +66,50 @@ describe('Enhanced JWKS Server with SQLite', () => {
     });
   });
 
+  describe('Utility Functions', () => {
+    it('should encrypt and decrypt data correctly', () => {
+      const serverModule = require('./server');
+      const text = 'test private key';
+      const encrypted = serverModule.encryptData(text);
+      assert.ok(encrypted.iv, 'Should have initialization vector');
+      assert.ok(encrypted.encryptedData, 'Should have encrypted data');
+      assert.ok(encrypted.authTag, 'Should have auth tag');
+      const decrypted = serverModule.decryptData(encrypted);
+      assert.strictEqual(decrypted, text, 'Decrypted text should match original');
+    });
+
+    it('should generate valid RSA key pair', () => {
+      const serverModule = require('./server');
+      const expiry = Math.floor(Date.now() / 1000) + 3600;
+      const keyPair = serverModule.generateKeyPair(expiry);
+      assert.ok(keyPair.publicKey.includes('BEGIN PUBLIC KEY'), 'Should generate valid public key');
+      assert.ok(keyPair.privateKey.includes('BEGIN PRIVATE KEY'), 'Should generate valid private key');
+      assert.strictEqual(keyPair.expiry, expiry, 'Expiry should match input');
+    });
+
+    it('should store and retrieve key correctly', (done) => {
+      const serverModule = require('./server');
+      const privateKey = '-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----';
+      const expiry = Math.floor(Date.now() / 1000) + 3600;
+      serverModule.storeKey(privateKey, expiry).then((kid) => {
+        serverModule.getKey(kid).then((retrievedKey) => {
+          assert.strictEqual(retrievedKey, privateKey, 'Retrieved key should match stored key');
+          done();
+        }).catch(done);
+      }).catch(done);
+    });
+
+    it('should handle decryption failure', () => {
+      const serverModule = require('./server');
+      const invalidEncryptedData = {
+        iv: 'invalid_iv',
+        encryptedData: 'invalid_data',
+        authTag: 'invalid_tag'
+      };
+      assert.throws(() => serverModule.decryptData(invalidEncryptedData), /Invalid/, 'Should throw on invalid decryption');
+    });
+  });
+
   describe('GET /.well-known/jwks.json', () => {
     it('should return only non-expired keys', (done) => {
       request(app)
@@ -73,7 +122,6 @@ describe('Enhanced JWKS Server with SQLite', () => {
           const jwks = response.body;
           assert.ok(jwks.keys.length > 0, 'Should return at least one key');
           
-          // Confirm keys have required properties
           jwks.keys.forEach(key => {
             assert.ok(key.kid, 'Key should have a kid');
             assert.strictEqual(key.use, 'sig');
@@ -82,6 +130,19 @@ describe('Enhanced JWKS Server with SQLite', () => {
             assert.ok(key.e, 'Key should have exponent');
           });
           
+          done();
+        });
+    });
+
+    it('should handle database errors', (done) => {
+      sinon.stub(db, 'all').callsArgWith(2, new Error('Database error'));
+      request(app)
+        .get('/.well-known/jwks.json')
+        .expect(500)
+        .end((err, res) => {
+          if (err) return done(err);
+          assert.strictEqual(res.body.error, 'Internal server error');
+          db.all.restore();
           done();
         });
     });
@@ -129,6 +190,45 @@ describe('Enhanced JWKS Server with SQLite', () => {
           done();
         });
     });
+
+    it('should return 404 when no key is found', (done) => {
+      sinon.stub(db, 'get').callsArgWith(2, null, null);
+      request(app)
+        .post('/auth')
+        .expect(404)
+        .end((err, res) => {
+          if (err) return done(err);
+          assert.strictEqual(res.body.error, 'Key not found');
+          db.get.restore();
+          done();
+        });
+    });
+
+    it('should handle database errors', (done) => {
+      sinon.stub(db, 'get').callsArgWith(2, new Error('Database error'));
+      request(app)
+        .post('/auth')
+        .expect(500)
+        .end((err, res) => {
+          if (err) return done(err);
+          assert.strictEqual(res.body.error, 'Internal server error');
+          db.get.restore();
+          done();
+        });
+    });
+
+    it('should handle JWT signing errors', (done) => {
+      sinon.stub(crypto, 'createDecipheriv').throws(new Error('Decryption error'));
+      request(app)
+        .post('/auth')
+        .expect(500)
+        .end((err, res) => {
+          if (err) return done(err);
+          assert.strictEqual(res.body.error, 'Error signing token');
+          crypto.createDecipheriv.restore();
+          done();
+        });
+    });
     
     it('should log authentication requests', (done) => {
       request(app)
@@ -137,7 +237,6 @@ describe('Enhanced JWKS Server with SQLite', () => {
         .end((err, res) => {
           if (err) return done(err);
           
-          // Check if the log was created
           db.get('SELECT COUNT(*) as count FROM auth_logs', (err, row) => {
             if (err) return done(err);
             assert.ok(row.count > 0, 'Should have authentication logs');
@@ -149,18 +248,18 @@ describe('Enhanced JWKS Server with SQLite', () => {
     it('should respect rate limits', function(done) {
       this.timeout(5000);
       
-      // Send 11 requests (1 more than the limit)
       const requests = [];
       for (let i = 0; i < 11; i++) {
         requests.push(request(app).post('/auth'));
       }
       
-      // Execute all requests as fast as possible
       Promise.all(requests.map(r => r.catch(e => e)))
         .then(responses => {
-          // Check if at least one request was rate limited
           const rateLimited = responses.some(res => res.status === 429);
           assert.ok(rateLimited, 'Should have rate limited at least one request');
+          const rateLimitedResponse = responses.find(res => res.status === 429);
+          assert.strictEqual(rateLimitedResponse.body.error, 'Too many requests');
+          assert.ok(rateLimitedResponse.headers['rate-limit'], 'Should include rate limit headers');
           done();
         })
         .catch(done);
@@ -180,7 +279,6 @@ describe('Enhanced JWKS Server with SQLite', () => {
           
           assert.ok(response.body.password, 'Should return a generated password');
           
-          // Verify the user was created in the database
           db.get('SELECT * FROM users WHERE username = ?', [username], (err, row) => {
             if (err) return done(err);
             assert.ok(row, 'User should exist in database');
@@ -194,7 +292,6 @@ describe('Enhanced JWKS Server with SQLite', () => {
     it('should reject duplicate usernames', (done) => {
       const username = `test_user_${Date.now()}`;
       
-      // First registration
       request(app)
         .post('/register')
         .send({ username, email: `${username}@example.com` })
@@ -202,7 +299,6 @@ describe('Enhanced JWKS Server with SQLite', () => {
         .end((err) => {
           if (err) return done(err);
           
-          // Try to register with the same username
           request(app)
             .post('/register')
             .send({ username, email: `${username}2@example.com` })
@@ -212,6 +308,18 @@ describe('Enhanced JWKS Server with SQLite', () => {
               assert.strictEqual(res.body.error, 'Username already exists');
               done();
             });
+        });
+    });
+
+    it('should reject missing username or email', (done) => {
+      request(app)
+        .post('/register')
+        .send({ email: 'test@example.com' })
+        .expect(400)
+        .end((err, res) => {
+          if (err) return done(err);
+          assert.strictEqual(res.body.error, 'Username and email are required');
+          done();
         });
     });
   });
@@ -240,12 +348,34 @@ describe('Enhanced JWKS Server with SQLite', () => {
           done();
         });
     });
+
+    it('should handle CORS preflight requests', (done) => {
+      request(app)
+        .options('/auth')
+        .expect(200)
+        .end((err, res) => {
+          if (err) return done(err);
+          assert.strictEqual(res.status, 200, 'Should return 200 for OPTIONS request');
+          done();
+        });
+    });
+
+    it('should return 404 for unknown routes', (done) => {
+      request(app)
+        .get('/unknown')
+        .expect(404)
+        .end((err, res) => {
+          if (err) return done(err);
+          assert.strictEqual(res.body.error, 'Not found');
+          done();
+        });
+    });
   });
 
   describe('SQL injection protection', () => {
     it('should safely handle malicious input in query parameters', (done) => {
       request(app)
-        .post('/auth?expired=1%27%20OR%20%271%27=%271') // Trying SQL injection: ?expired=1' OR '1'='1
+        .post('/auth?expired=1%27%20OR%20%271%27=%271')
         .expect(200)
         .end((err, res) => {
           if (err) return done(err);
@@ -262,13 +392,40 @@ describe('Enhanced JWKS Server with SQLite', () => {
         .end((err) => {
           if (err) return done(err);
           
-          // Verify the users table still exists
           db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='users'", (err, row) => {
             if (err) return done(err);
             assert.ok(row, 'Users table should still exist after SQL injection attempt');
             done();
           });
         });
+    });
+  });
+
+  describe('Server shutdown', () => {
+    it('should handle SIGINT gracefully', (done) => {
+      const dbCloseSpy = sinon.spy(db, 'close');
+      const serverCloseSpy = sinon.spy(server, 'close');
+      process.emit('SIGINT');
+      setTimeout(() => {
+        assert.ok(dbCloseSpy.called, 'Database close should be called');
+        assert.ok(serverCloseSpy.called, 'Server close should be called');
+        dbCloseSpy.restore();
+        serverCloseSpy.restore();
+        done();
+      }, 100);
+    });
+
+    it('should handle SIGTERM gracefully', (done) => {
+      const dbCloseSpy = sinon.spy(db, 'close');
+      const serverCloseSpy = sinon.spy(server, 'close');
+      process.emit('SIGTERM');
+      setTimeout(() => {
+        assert.ok(dbCloseSpy.called, 'Database close should be called');
+        assert.ok(serverCloseSpy.called, 'Server close should be called');
+        dbCloseSpy.restore();
+        serverCloseSpy.restore();
+        done();
+      }, 100);
     });
   });
 });

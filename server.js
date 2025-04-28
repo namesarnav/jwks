@@ -4,24 +4,8 @@ Arnav Verma
 CSCE 3550
 11627633
 
-Enhanced JWKS Server with AES encryption, user registration, authentication logging,
-and rate limiting.
-
 I have used AI in my project mainly for documentation and adding comments in the code for better understanding 
-Prompt: "Add comments to the code explaining the functionality of each function and module"
 //---------------------------------------------------------------------- */ 
-
-/**
- * JWKS (JSON Web Key Set) Server Implementation
- * This server provides endpoints for JWT authentication and JWKS key management
- * with support for both valid and expired keys stored in SQLite database.
- * 
- * Enhancements:
- * - AES encryption for private keys in database
- * - User registration with Argon2 password hashing
- * - Authentication request logging
- * - Rate limiting for authentication requests
- */
 
 const express = require('express');
 const crypto = require('crypto');
@@ -135,7 +119,6 @@ function generateKeyPair(expiry) {
  * @param {number} expiry - Expiry timestamp
  * @returns {Promise} Promise that resolves with the key ID
  */
-
 function storeKey(privateKey, expiry) {
   return new Promise((resolve, reject) => {
     // Encrypt the private key before storing
@@ -458,17 +441,12 @@ app.use((req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
-/**
- * Start the server on localhost:8080
- * The server only accepts connections from 127.0.0.1 for security
- */
+
 const server = app.listen(8080, '127.0.0.1', () => {
   console.log('Enhanced JWKS server running on http://127.0.0.1:8080');
 });
 
-/**
- * Graceful shutdown function to close database connection when the server stops
- */
+
 function shutdown() {
   console.log('Closing database connection and shutting down server...');
   db.close();
